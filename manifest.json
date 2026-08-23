@@ -1,4 +1,11 @@
 {
-  "Version": "4.2.1",
-  "Dependencies": {}
+"Version": "4.2.2",
+"Dependencies": {
+  "Alife.Function.FunctionCaller": ""
+},
+"Environments": {
+  "nuget": {
+    "System.Security.Cryptography.ProtectedData": ">=9.0.0"
+  }
+}
 }

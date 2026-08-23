@@ -13,7 +13,7 @@ using Microsoft.JSInterop;
 namespace OneChuxin.TokenStats;
 
 // 模块配置页面板（ModuleDetailView 经 DynamicComponent 挂载）。
-// 布局：用量快照（直接读 usage-log.jsonl，未激活可看）+ 偏好（圆环统计范围快捷选择）
+// 布局：用量快照（读汇总日志 usage-log.jsonl，全部角色口径，未激活可看）+ 偏好（圆环统计范围快捷选择）
 // + 数据管理（清空历史，二次确认）+ 使用指引；端口/尺寸/间距等调优参数收进"高级设置"折叠块，
 // 配置表单经 DefaultUI 保留其中，保存仍用页面底部"应用到全局/角色"按钮。
 public class TokenStatsUI : ModuleUIBase<TokenStatsModule, TokenStatsConfig>, IDisposable
@@ -39,8 +39,16 @@ public class TokenStatsUI : ModuleUIBase<TokenStatsModule, TokenStatsConfig>, ID
     string statusMsg = "";
     DateTime msgAt;
 
+    // 渠道价格设置（全局 pricing.json；编辑副本，点保存才落盘）
+    List<PriceRule> rules = new();
+    List<ChannelInfo> channels = new();
+    string priceMsg = "";
+    DateTime priceMsgAt;
+
     protected override void OnInitialized()
     {
+        rules = PricingStore.Rules().Select(r => r.Clone()).ToList();
+        LoadChannelList();
         Rebuild();
         refreshTimer = new Timer(_ => _ = InvokeAsync(() =>
         {
@@ -48,9 +56,20 @@ public class TokenStatsUI : ModuleUIBase<TokenStatsModule, TokenStatsConfig>, ID
                 armedAction = null;
             if (statusMsg.Length > 0 && (DateTime.Now - msgAt).TotalSeconds > 8)
                 statusMsg = "";
+            if (priceMsg.Length > 0 && (DateTime.Now - priceMsgAt).TotalSeconds > 8)
+                priceMsg = "";
             Rebuild();
             StateHasChanged();
         }), null, 3000, 3000);
+    }
+
+    void LoadChannelList()
+    {
+        try { channels = Module?.GetLiveChannels() ?? new List<ChannelInfo>(); }
+        catch { channels = new List<ChannelInfo>(); }
+        foreach (ChannelInfo scanned in PricingStore.ScanChannels())
+            if (!channels.Exists(c => c.Owner == scanned.Owner && c.Name == scanned.Name && c.Model == scanned.Model))
+                channels.Add(scanned);
     }
 
     protected override void BuildRenderTree(RenderTreeBuilder b)
@@ -88,6 +107,171 @@ public class TokenStatsUI : ModuleUIBase<TokenStatsModule, TokenStatsConfig>, ID
         }
         b.CloseElement();
 
+        // 渠道价格设置：检测到的渠道一键建规则 + 规则列表编辑（全局生效，展示时计价）
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "tsui-sec");
+        b.OpenElement(seq++, "span");
+        b.AddAttribute(seq++, "class", "tsui-sdot");
+        b.CloseElement();
+        b.OpenElement(seq++, "span");
+        b.AddAttribute(seq++, "class", "tsui-stitle");
+        b.AddContent(seq++, "渠道价格");
+        b.CloseElement();
+        b.OpenElement(seq++, "span");
+        b.AddAttribute(seq++, "class", "tsui-ssub");
+        b.AddContent(seq++, "元/百万tokens · 匹配：URL>模型>渠道名（任填其一即可）· 峰=工作日 9:00–12:00 / 14:00–18:00，谷=其余 · 全局生效，改价后历史费用即时重定价");
+        b.CloseElement();
+        b.CloseElement(); // sec
+
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "tsui-chrow");
+        b.OpenElement(seq++, "span");
+        b.AddAttribute(seq++, "class", "tsui-clb");
+        b.AddContent(seq++, "检测到的渠道（点击为其生成价格规则）：");
+        b.CloseElement();
+        if (channels.Count == 0)
+        {
+            b.OpenElement(seq++, "span");
+            b.AddAttribute(seq++, "class", "tsui-cnone");
+            b.AddContent(seq++, "未检测到灵枢渠道（角色未激活或未配置），可手动新增规则");
+            b.CloseElement();
+        }
+        else
+        {
+            b.OpenElement(seq++, "div");
+            b.AddAttribute(seq++, "class", "tsui-pills");
+            for (int i = 0; i < channels.Count; i++)
+            {
+                int idx = i;
+                ChannelInfo c = channels[i];
+                b.OpenElement(seq++, "button");
+                b.AddAttribute(seq++, "class", "tsui-pill");
+                b.AddAttribute(seq++, "type", "button");
+                b.AddAttribute(seq++, "title", $"{c.Owner} · {c.Model} @ {c.Host}（点击生成价格规则）");
+                b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () => AddChannelRule(idx)));
+                b.AddContent(seq++, $"{c.Name} · {c.Model}");
+                b.CloseElement();
+            }
+            b.CloseElement();
+        }
+        b.CloseElement(); // chrow
+
+        for (int i = 0; i < rules.Count; i++)
+        {
+            int idx = i;
+            PriceRule r = rules[i];
+            b.OpenElement(seq++, "div");
+            b.AddAttribute(seq++, "class", "tsui-prow");
+
+            // 字段顺序：渠道名 → URL → 模型名 → 峰谷开关 → 价格；
+            // 渠道名同时作为显示名与匹配名（合并旧"规则名/渠道名匹配"两字段）
+            void Field(string cls, string label, string val, Action<string> set)
+            {
+                b.OpenElement(seq++, "span");
+                b.AddAttribute(seq++, "class", "tsui-nw");
+                b.OpenElement(seq++, "span");
+                b.AddAttribute(seq++, "class", "tsui-lb");
+                b.AddContent(seq++, label);
+                b.CloseElement();
+                b.OpenElement(seq++, "input");
+                b.AddAttribute(seq++, "type", "text");
+                b.AddAttribute(seq++, "class", cls);
+                b.AddAttribute(seq++, "value", val);
+                b.AddAttribute(seq++, "onchange", EventCallback.Factory.CreateBinder(this, v => set(v), val));
+                b.CloseElement();
+                b.CloseElement();
+            }
+            void Num(string label, decimal val, Action<decimal> set)
+            {
+                b.OpenElement(seq++, "span");
+                b.AddAttribute(seq++, "class", "tsui-nw");
+                b.OpenElement(seq++, "span");
+                b.AddAttribute(seq++, "class", "tsui-lb");
+                b.AddContent(seq++, label);
+                b.CloseElement();
+                b.OpenElement(seq++, "input");
+                b.AddAttribute(seq++, "type", "number");
+                b.AddAttribute(seq++, "step", "0.01");
+                b.AddAttribute(seq++, "class", "tsui-num");
+                b.AddAttribute(seq++, "value", BindConverter.FormatValue(val));
+                b.AddAttribute(seq++, "onchange", EventCallback.Factory.CreateBinder(this, v => set(v), val));
+                b.CloseElement();
+                b.CloseElement();
+            }
+
+            Field("tsui-pk", "渠道名", r.ChannelMatch ?? r.Name, v => { rules[idx].Name = v; rules[idx].ChannelMatch = v; });
+            Field("tsui-pm", "URL（推荐）", r.UrlMatch ?? "", v => rules[idx].UrlMatch = v);
+            Field("tsui-pm", "模型名", r.ModelMatch ?? "", v => rules[idx].ModelMatch = v);
+
+            b.OpenElement(seq++, "label");
+            b.AddAttribute(seq++, "class", "tsui-chk");
+            b.AddAttribute(seq++, "title", "开启=分高峰/谷段两档价；关闭=单一价格（峰段也按谷价档计算）");
+            b.OpenElement(seq++, "input");
+            b.AddAttribute(seq++, "type", "checkbox");
+            b.AddAttribute(seq++, "checked", r.PeakEnabled);
+            b.AddAttribute(seq++, "onchange", EventCallback.Factory.CreateBinder(this, v => rules[idx].PeakEnabled = v, r.PeakEnabled));
+            b.CloseElement();
+            b.AddContent(seq++, "峰谷");
+            b.CloseElement();
+
+            // 峰谷开关联动：开=六格（峰/谷各三档），关=三格单一价（编辑谷价档，峰价保留待再开启）
+            if (r.PeakEnabled)
+            {
+                Num("命中·峰", r.HitPeak, v => rules[idx].HitPeak = v);
+                Num("命中·谷", r.HitOff, v => rules[idx].HitOff = v);
+                Num("未中·峰", r.MissPeak, v => rules[idx].MissPeak = v);
+                Num("未中·谷", r.MissOff, v => rules[idx].MissOff = v);
+                Num("输出·峰", r.OutPeak, v => rules[idx].OutPeak = v);
+                Num("输出·谷", r.OutOff, v => rules[idx].OutOff = v);
+            }
+            else
+            {
+                Num("命中价", r.HitOff, v => rules[idx].HitOff = v);
+                Num("未命中价", r.MissOff, v => rules[idx].MissOff = v);
+                Num("输出价", r.OutOff, v => rules[idx].OutOff = v);
+            }
+
+            b.OpenElement(seq++, "button");
+            b.AddAttribute(seq++, "class", "tsui-del");
+            b.AddAttribute(seq++, "type", "button");
+            b.AddAttribute(seq++, "title", "删除该规则");
+            b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, () => DelRule(idx)));
+            b.AddContent(seq++, "删");
+            b.CloseElement();
+
+            b.CloseElement(); // prow
+        }
+
+        b.OpenElement(seq++, "div");
+        b.AddAttribute(seq++, "class", "tsui-pbar");
+        b.OpenElement(seq++, "button");
+        b.AddAttribute(seq++, "class", "tsui-btn");
+        b.AddAttribute(seq++, "type", "button");
+        b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, AddRule));
+        b.AddContent(seq++, "＋ 手动添加渠道/规则");
+        b.CloseElement();
+        b.OpenElement(seq++, "button");
+        b.AddAttribute(seq++, "class", "tsui-btn");
+        b.AddAttribute(seq++, "type", "button");
+        b.AddAttribute(seq++, "title", "恢复为 DeepSeek V4-Flash / V4-Pro 官方峰谷价");
+        b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, RestoreDefaultPrices));
+        b.AddContent(seq++, "恢复官方默认价");
+        b.CloseElement();
+        b.OpenElement(seq++, "button");
+        b.AddAttribute(seq++, "class", "tsui-btn pri");
+        b.AddAttribute(seq++, "type", "button");
+        b.AddAttribute(seq++, "onclick", EventCallback.Factory.Create(this, SavePricingFromUi));
+        b.AddContent(seq++, "保存价格规则");
+        b.CloseElement();
+        if (priceMsg.Length > 0)
+        {
+            b.OpenElement(seq++, "span");
+            b.AddAttribute(seq++, "class", "tsui-status");
+            b.AddContent(seq++, priceMsg);
+            b.CloseElement();
+        }
+        b.CloseElement(); // pbar
+
         // 数据管理：按时间段清除 / 全部清空（均二次确认）
         b.OpenElement(seq++, "div");
         b.AddAttribute(seq++, "class", "tsui-sec");
@@ -100,7 +284,7 @@ public class TokenStatsUI : ModuleUIBase<TokenStatsModule, TokenStatsConfig>, ID
         b.CloseElement();
         b.OpenElement(seq++, "span");
         b.AddAttribute(seq++, "class", "tsui-ssub");
-        b.AddContent(seq++, "清除指定时间段（精确到秒）或全部用量日志，不影响当前会话统计");
+        b.AddContent(seq++, "清除指定时间段（精确到秒）或全部用量日志（汇总 + 各角色分日志），不影响当前会话统计");
         b.CloseElement();
         b.CloseElement(); // sec
 
@@ -217,6 +401,48 @@ public class TokenStatsUI : ModuleUIBase<TokenStatsModule, TokenStatsConfig>, ID
         StateHasChanged();
     }
 
+    void AddRule()
+    {
+        rules.Add(new PriceRule { Name = "新规则" });
+        StateHasChanged();
+    }
+
+    void DelRule(int idx)
+    {
+        if (idx >= 0 && idx < rules.Count)
+            rules.RemoveAt(idx);
+        StateHasChanged();
+    }
+
+    void AddChannelRule(int idx)
+    {
+        if (idx < 0 || idx >= channels.Count) return;
+        ChannelInfo c = channels[idx];
+        PriceRule r = PriceRule.Guess(c.Model);
+        r.Name = c.Name;
+        r.ChannelMatch = c.Name;
+        r.UrlMatch = c.Host.Length > 0 ? c.Host : null; // 域名比组名稳定，双匹配最稳
+        r.ModelMatch = null; // 渠道级规则不锁模型
+        rules.Add(r);
+        SavePricing($"已为渠道「{c.Name}」（{c.Owner}）创建价格规则，可继续调整单价后保存");
+    }
+
+    void RestoreDefaultPrices()
+    {
+        rules = PriceRule.Defaults();
+        SavePricing("已恢复 DeepSeek V4-Flash / V4-Pro 官方峰谷默认价");
+    }
+
+    void SavePricingFromUi() => SavePricing("价格规则已保存（全局生效，历史费用即时重定价）");
+
+    void SavePricing(string msg)
+    {
+        PricingStore.Save(rules);
+        priceMsg = msg;
+        priceMsgAt = DateTime.Now;
+        StateHasChanged();
+    }
+
     void Rebuild()
     {
         try { html = BuildHtml(Module); }
@@ -294,6 +520,21 @@ public class TokenStatsUI : ModuleUIBase<TokenStatsModule, TokenStatsConfig>, ID
         s.Append(".tsui-date:focus{border-color:#a9c4f8}");
         s.Append(".tsui-arrow{color:#b6bac4;font-size:11px}");
         s.Append(".tsui-status{font-size:11.5px;color:#2f6fd8}");
+        s.Append(".tsui-chrow{margin:2px 0 6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}");
+        s.Append(".tsui-clb{font-size:11px;color:#5c6270}");
+        s.Append(".tsui-cnone{font-size:11px;color:#b6bac4}");
+        s.Append(".tsui-prow{display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin:4px 0;padding:6px 8px;border:1px solid #e8eaf1;border-radius:9px;background:#fbfcfe}");
+        s.Append(".tsui-pk,.tsui-pm,.tsui-num{border:1px solid #dfe2ea;border-radius:7px;padding:4px 6px;font-size:11px;color:#5c6270;font-family:inherit;outline:0;background:#fff}");
+        s.Append(".tsui-pk{width:118px}.tsui-pm{width:96px}.tsui-num{width:64px;text-align:right}");
+        s.Append(".tsui-pk:focus,.tsui-pm:focus,.tsui-num:focus{border-color:#a9c4f8}");
+        s.Append(".tsui-nw{display:flex;flex-direction:column;align-items:center;gap:2px}");
+        s.Append(".tsui-lb{font-size:9px;color:#9aa1b0;white-space:nowrap}");
+        s.Append(".tsui-chk{display:flex;align-items:center;gap:4px;font-size:10.5px;color:#5c6270;margin:0 4px;cursor:pointer;user-select:none}");
+        s.Append(".tsui-pbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px}");
+        s.Append(".tsui-btn.pri{border-color:#a9c4f8;color:#2f6fd8;font-weight:600}");
+        s.Append(".tsui-btn.pri:hover{border-color:#2f6fd8;background:#f2f7ff;color:#2f6fd8}");
+        s.Append(".tsui-del{padding:3px 10px;border:1px solid #dfe2ea;border-radius:7px;background:#fff;color:#b6bac4;cursor:pointer;font-size:11px;font-family:inherit;transition:all .12s}");
+        s.Append(".tsui-del:hover{border-color:#f3b8b8;color:#c53030}");
         s.Append(".tsui-adv{margin-top:16px;border:1px dashed #e2e5ee;border-radius:11px;padding:10px 14px}");
         s.Append(".tsui-adv summary{font-size:11.5px;color:#9aa1b0;cursor:pointer;user-select:none}");
         s.Append(".tsui-adv summary:hover{color:#5c6270}");
@@ -318,8 +559,8 @@ public class TokenStatsUI : ModuleUIBase<TokenStatsModule, TokenStatsConfig>, ID
         }
         s.Append("</div>");
 
-        // 汇总：大数字 + 四格
-        s.Append($"<div class=\"tsui-hero\"><span class=\"hk\">TODAY · 总 TOKEN</span><span class=\"num\">{Fmt(todayV)}</span></div>");
+        // 汇总：大数字 + 四格（配置页快照读汇总日志=全部角色口径；各角色看板/挂件只读本角色分日志）
+        s.Append($"<div class=\"tsui-hero\"><span class=\"hk\">TODAY · 总 TOKEN（全部角色汇总）</span><span class=\"num\">{Fmt(todayV)}</span></div>");
         s.Append("<div class=\"tsui-cells\">");
         Cell(s, "今天", todayV, RoundsSince(today));
         Cell(s, "近7天", d7, RoundsSince(DateTime.Now.AddDays(-6).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)));

@@ -43,6 +43,8 @@ public class TokenStatsModule(ILogger<TokenStatsModule> logger, XmlFunctionCalle
     // AI 输出（识别 <Speak> 桌宠说话）；无标签轮（工具续轮等）继承上一轮来源
     string pendingUserMsg = "";
     readonly StringBuilder roundAiText = new();
+    int errScanPos = 0;   // 错误标签已统计到的 roundAiText 偏移：一轮内多次 LLM 调用（工具循环）时，
+                          // 每条用量记录只统计新增文本段，避免同一「出错：」被后续记录重复累计（4.2.4）
     string inheritSource = "系统";
 
     // 历史用量（按天聚合，键 yyyy-MM-dd 升序）。logFile=本角色分日志（usage-log.<角色名>.jsonl，
@@ -178,6 +180,7 @@ public class TokenStatsModule(ILogger<TokenStatsModule> logger, XmlFunctionCalle
         {
             pendingUserMsg = message ?? "";
             roundAiText.Clear();
+            errScanPos = 0;
         }
     }
 
@@ -193,9 +196,16 @@ public class TokenStatsModule(ILogger<TokenStatsModule> logger, XmlFunctionCalle
         if (usage.Total == 0 && usage.Input == 0 && usage.Output == 0) return;
         DateTime now = DateTime.Now;
         string src, aiText;
-        lock (sync) { aiText = roundAiText.ToString(); src = ClassifySource(pendingUserMsg, aiText, inheritSource); }
-        // 错误统计（4.7.0）：本轮 AI 输出含「出错：/出错:」的次数（与 <Speak> 同位取全量，流式跨片安全）
-        int errs = ErrorTagRegex.Matches(aiText).Count;
+        int errs;
+        lock (sync)
+        {
+            aiText = roundAiText.ToString();
+            src = ClassifySource(pendingUserMsg, aiText, inheritSource);
+            // 错误标签只统计本轮新增文本段（4.2.4）：工具循环的多条记录不再重复累计同一「出错：」
+            int freshFrom = errScanPos > aiText.Length ? 0 : Math.Min(errScanPos, aiText.Length);
+            errs = ErrorTagRegex.Matches(aiText.Substring(freshFrom)).Count;
+            errScanPos = aiText.Length;
+        }
         (string channel, string model, string host) = ResolveChannelAndModel();
         string line = $"{{\"t\":\"{now:yyyy-MM-dd'T'HH:mm:ss.fff}\",\"v\":{usage.Total},\"i\":{usage.Input},\"o\":{usage.Output},\"c\":{usage.Cached},\"m\":\"{JsonEscape(model)}\",\"s\":\"{JsonEscape(src)}\",\"ch\":\"{JsonEscape(channel)}\",\"h\":\"{JsonEscape(host)}\",\"n\":\"{JsonEscape(Character?.Name ?? "")}\"" + (errs > 0 ? $",\"e\":{errs}" : "") + "}";
         bool peak = PricingStore.IsPeak(now);
@@ -636,10 +646,25 @@ public class TokenStatsModule(ILogger<TokenStatsModule> logger, XmlFunctionCalle
         catch { return -1; }
     }
 
-    // 当前有效渠道 + 模型 + endpoint域名：灵枢 = 强制锁定组（默认容灾模式下，容灾成功会先于
-    // 响应返回把 ForcedGroupIndex 持久化，故 TokenUsed 时读到的即本轮实际渠道；「优先主渠道」
-    // 模式下的瞬时容灾不落配置，该轮会归因到起始组——已知小概率误差，见实现方案文档）；
-    // 其余语言模型视为单渠道（渠道名取 endpoint 域名，取不到则"默认渠道"）。
+    // 灵枢归因接口（≥4.5 方案）：最近一次成功服务的渠道组 slot（模块类实例属性，瞬态不落盘）。
+    // 覆盖「优先主渠道」静默容灾、锁定组故障绕行等 ForcedGroupIndex 反映不了的场景；
+    // 旧版灵枢（≤4.4）无此属性返回 -1，由 ResolveChannelAndModel 回退到 ForcedGroupIndex。
+    // 属性在 HTTP 管道成功分支写入，早于流末尾的 TokenUsed 回调，读取时序安全。
+    int ReadLastServedGroupIndex()
+    {
+        try
+        {
+            object? lm = ChatBot.LanguageModel;
+            return lm?.GetType().GetProperty("LastServedGroupIndex")?.GetValue(lm) is int i ? i : -1;
+        }
+        catch { return -1; }
+    }
+
+    // 当前有效渠道 + 模型 + endpoint域名：灵枢归因优先级 =
+    // LastServedGroupIndex（≥4.5 归因接口，本轮实际服务的组，含静默容灾/锁定绕行）
+    // → ForcedGroupIndex（旧版灵枢回退：默认容灾模式下容灾成功会把锁定持久化到响应返回前，
+    // TokenUsed 时读到的即本轮渠道；但「优先主渠道」模式与锁定绕行场景会归因到起始组——已知误差）
+    // → 第一个已配置组。其余语言模型视为单渠道（渠道名取 endpoint 域名，取不到则"默认渠道"）。
     // 域名随日志落盘（h 字段），价格规则可按 URL 匹配（比组名稳定，推荐）。
     (string Channel, string Model, string Host) ResolveChannelAndModel()
     {
@@ -648,7 +673,8 @@ public class TokenStatsModule(ILogger<TokenStatsModule> logger, XmlFunctionCalle
             List<RouterGroup> groups = ReadRouterGroups();
             if (groups.Count > 0)
             {
-                int forced = ReadForcedGroupIndex();
+                int served = ReadLastServedGroupIndex();
+                int forced = served >= 0 ? served : ReadForcedGroupIndex();
                 RouterGroup? eff = groups.FirstOrDefault(g => g.Configured && g.Slot == forced)
                     ?? groups.FirstOrDefault(g => g.Configured)
                     ?? groups[0];
@@ -1045,7 +1071,8 @@ public class TokenStatsModule(ILogger<TokenStatsModule> logger, XmlFunctionCalle
                     string channel = parts.Length > 1 ? parts[1] : "";
                     string host = parts.Length > 2 ? parts[2] : "";
                     bool hit =
-                        (!string.IsNullOrWhiteSpace(url) && (host.Contains(url, StringComparison.OrdinalIgnoreCase) || channel.Contains(url, StringComparison.OrdinalIgnoreCase))) ||
+                        PricingStore.UrlLooseMatch(host, url) ||
+                        PricingStore.UrlLooseMatch(channel, url) ||
                         (!string.IsNullOrWhiteSpace(name) && channel.Contains(name, StringComparison.OrdinalIgnoreCase));
                     if (!hit) continue;
                     if (!merged.TryGetValue(m.Key, out Agg[]? slots)) merged[m.Key] = slots = new Agg[2];
@@ -1402,8 +1429,28 @@ public class TokenStatsModule(ILogger<TokenStatsModule> logger, XmlFunctionCalle
         static string Dec(decimal d) => d.ToString("0.####", CultureInfo.InvariantCulture);
     }
 
-    static string JsonEscape(string s) =>
-        s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "").Replace("\n", "\\n");
+    // JSON 字符串转义（4.2.4 补全）：除既有 \ " \r \n 外，补 \t 与全部其余 C0 控制字符（\u00XX），
+    // 避免渠道名/模型名等字段携带控制字符时产生非法 JSON 行导致该条记录解析失败
+    static string JsonEscape(string s)
+    {
+        StringBuilder sb = new(s.Length + 8);
+        foreach (char c in s)
+        {
+            switch (c)
+            {
+                case '\\': sb.Append("\\\\"); break;
+                case '"': sb.Append("\\\""); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < ' ') { sb.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture)); }
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        return sb.ToString();
+    }
 
     // 向主窗口页面注册本实例（端口+角色名+外观）。页面端为共享管理器（__tstatsMgr）：
     // 多角色多开时页面上只有一个挂件，数据源跟随主窗口当前查看的角色（路由 /agent/{name}），

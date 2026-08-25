@@ -149,6 +149,16 @@ public static class PricingStore
         catch { }
     }
 
+    // URL 宽松匹配（4.2.4 修复）：实参通常是记录的 host 域名（如 tokenrhythm.studio），而用户配置的
+    // urlMatch/url 惯常填带 scheme 的完整地址（如 https://tokenrhythm.studio/v1）——单向 Contains 会因
+    // 短串不含长串而静默失配，故改双向包含。任一侧为空返回 false。
+    public static bool UrlLooseMatch(string? candidate, string? pattern)
+    {
+        if (string.IsNullOrWhiteSpace(candidate) || string.IsNullOrWhiteSpace(pattern)) return false;
+        StringComparison ic = StringComparison.OrdinalIgnoreCase;
+        return candidate.Contains(pattern, ic) || pattern.Contains(candidate, ic);
+    }
+
     public static PriceRule? Match(string? channel, string? model, string? url = null)
     {
         PriceRule? best = null;
@@ -156,8 +166,7 @@ public static class PricingStore
         foreach (PriceRule r in Rules())
         {
             int score = 0;
-            if (!string.IsNullOrWhiteSpace(r.UrlMatch) && url != null
-                && url.Contains(r.UrlMatch, StringComparison.OrdinalIgnoreCase)) score += 4;
+            if (!string.IsNullOrWhiteSpace(r.UrlMatch) && UrlLooseMatch(url, r.UrlMatch)) score += 4;
             if (!string.IsNullOrWhiteSpace(r.ModelMatch) && model != null
                 && model.Contains(r.ModelMatch, StringComparison.OrdinalIgnoreCase)) score += 2;
             if (!string.IsNullOrWhiteSpace(r.ChannelMatch) && channel != null
